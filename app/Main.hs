@@ -1,9 +1,7 @@
 module Main where
 
-import HindleyMilner (someFunc)
+import HindleyMilner
 
 main :: IO ()
 main = do
   putStrLn "Hello, Haskell!"
-  someFunc
-
