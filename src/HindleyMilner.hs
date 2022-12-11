@@ -35,6 +35,8 @@ data Expr =
     deriving Show
 
 type StringMap = HashMap String
+
+-- | A substitution is mapping from a type variable to a type.
 type Subst = StringMap Ty
 
 -- | Inserts a type variable constraint. E.g. may constrain the type 't1' to Int.
@@ -55,6 +57,7 @@ tyvarsFromType (TyVar v) = HS.singleton v
 tyvarsFromType (TyLambda a b) = HS.union (tyvarsFromType a) (tyvarsFromType b)
 tyvarsFromType (TyLit _) = HS.empty
 
+-- | An environment is mapping from a symbol to its type and unbound type variables.
 type Env = StringMap (Ty, StringSet)
 
 -- | Retrieves the set of type variables which occurr in the environment.
@@ -80,6 +83,11 @@ makeNewType = do
     return $ TyVar ("t" ++ show i)
 
 -- | Instantiates a type by giving its type variables unique identifiers.
+-- E.g. in the type (a -> a) 'a' does not refer to a unique type named
+-- a but any type possible. We use the state monad to generate a unique
+-- type variable, e.g. 't0' instead, so the type becomes t0 -> t0.
+-- Question: Is this robust? Can we create a variable or something which
+-- leads to problems? The typing haskell in haskell paper did something similar.
 instantiateType :: Ty -> StringSet -> State Int Ty
 instantiateType t tvars = do
     i <- get
@@ -99,12 +107,21 @@ envGet v e = case HM.lookup v e of
     Just (t, tvars) -> instantiateType t tvars
     Nothing -> error $ "Unbound variable: " ++ show v
 
--- | Refines the environment 
+-- | Refines the environment by applying all subsitutions.
+-- E.g. we may have found that the expression 'four' has type
+-- 'Int'. This function will substitute all occurrences of 'four'
+-- in any other expression with 'Int'.
 refineEnv :: Subst -> Env -> Env
 refineEnv s = HM.map refineEntry
     where
+        -- | Refines the type 't'.
         refineEntry (t, v) =
-            (refineType (HS.foldr HM.delete s v) t, v)
+            (refineType 
+                -- Why are we removing all substitutions of type variables?
+                -- Because these variables are unbound by definition?
+                -- Avoiding some sort of collision?
+                ( HS.foldr HM.delete s v ) 
+                t, v)
 
 -- | Unifies two types using the available substitutions by adding
 -- the subsitutions which unify them.
@@ -116,8 +133,9 @@ unify t1 t2 s =
             if v1 == v2 then s else uncurry failUnify ab
 
         -- We can always unify a type variable with a non type variable if
-        -- no cycles occurr, i.e. 'v1' occurrs in the type varaibles of the
-        -- unrefined type 't2'.
+        -- no cycles occurr. Consider the substitution a: b -> a. Trying to
+        -- refine using this substitution would create an infinite loop, so
+        -- we must make sure (here) that we do not create any such substitutions.
         ab@(TyVar v1, b) ->
             if noCycle v1 t2 then makeConstraint v1 t2' s else uncurry failUnify ab
 
@@ -151,14 +169,42 @@ generalize e t = (t, d)
         etvars = tyvarsFromEnv e
         d = HS.difference tvars etvars
 
+-- | The meat and potatoes of the type inference.
+--
+-- Inspects the expression 'expr' with regards to the current
+-- environment and a mapping of substitutions by trying to unify
+-- the expression with a type 'ty'. The result is an extended mapping
+-- of substitutions which can be used to refine the type 'ty'.
+--
+-- This is the function which actually binds the programming language
+-- and the type system together. By inspecting an expression together
+-- with a type variable we can then inspect that type variable using
+-- the resulting list of substitutions to find out its type.
 inspectExpr :: Env -> Expr -> Ty -> Subst -> State Int Subst
 inspectExpr env expr ty subs =
     case expr of
+        -- If the expression is a literal try to unify its type with 'ty'.
+        -- For the simple case where 'ty' is a type variable this simply
+        -- adds a substitution of 'ty' with the type of literal.
+
+        -- If 'ty' is the type of a literal then this verifies that the
+        -- expression type and 'ty' does indeed match.
         Lit l -> return $ unify ty (TyLit (litToType l)) subs
+
+        -- If the expression is a variable then we retrieve its bound
+        -- type from the environment, refine it using the supplied substitutions,
+        -- and then try to unify it with 'ty'.
+        --
+        -- Note that retrieving an unbound variable is an error. So any variable
+        -- we typecheck needs to bound by the environment. This binding is either
+        -- done via an enclosing 'let' expression or by structuring the typechecking
+        -- in such a way that this is not a problem.
+        -- Question: Is this done via a dependency graph? By assigning it a type variable?
         Var v -> do
             nt <- envGet v env
             let t = refineType subs nt
             return $ unify ty t subs
+
         Let v e1 e2 -> do
             e1Ty <- makeNewType
             subs' <- inspectExpr env e1 e1Ty subs
@@ -166,12 +212,14 @@ inspectExpr env expr ty subs =
                 scheme = generalize (refineEnv subs' env) e1Ty'
                 env' = envAdd v scheme env
             inspectExpr (refineEnv subs' env') e2 ty subs'
+
         Lambda v e ->do
             vt <- makeNewType
             et <- makeNewType
             let newSubs = unify ty (TyLambda vt et) subs
                 newEnv = envAdd v (vt, HS.empty) env
             inspectExpr newEnv e et newSubs
+
         App f e ->do
             et <- makeNewType
             let ft = TyLambda et ty
@@ -185,6 +233,7 @@ defaultEnv =
     , ("-", TyLambda (TyLit TyInt) (TyLambda (TyLit TyInt) (TyLit TyInt)))
     , ("^", TyLambda (TyLit TyStr) (TyLambda (TyLit TyStr) (TyLit TyStr)))
     , ("=", TyLambda (TyVar "a") (TyLambda (TyVar "a") (TyLit TyBool)))
+    , ("/=", TyLambda (TyVar "a") (TyLambda (TyVar "a") (TyLit TyBool)))
     , ("not", TyLambda (TyLit TyBool) (TyLit TyBool))
     ]
 
